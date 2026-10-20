@@ -1,4 +1,3 @@
-
 import asyncio
 from collections import deque
 
@@ -12,19 +11,38 @@ from app.services.gemini import generate_reply
 
 router = APIRouter(prefix="/webhook", tags=["Webhook"])
 
-# In-memory duplicate protection for this running server.
-# This cache resets when the application restarts.
 MAX_SEEN_MESSAGES = 5000
+
+# Message IDs successfully answered.
 seen_message_ids = set()
 seen_message_order = deque()
+
+# Message IDs currently being processed.
+processing_message_ids = set()
+
 message_lock = asyncio.Lock()
 
 
-async def already_processed(message_id: str) -> bool:
-    """Atomically check and record a Meta message ID."""
+async def claim_message(message_id: str) -> bool:
+    """Claim a message unless it is completed or already processing."""
     async with message_lock:
-        if message_id in seen_message_ids:
-            return True
+        if (
+            message_id in seen_message_ids
+            or message_id in processing_message_ids
+        ):
+            return False
+
+        processing_message_ids.add(message_id)
+        return True
+
+
+async def finish_message(message_id: str, success: bool):
+    """Record success only after Facebook accepts the reply."""
+    async with message_lock:
+        processing_message_ids.discard(message_id)
+
+        if not success or message_id in seen_message_ids:
+            return
 
         seen_message_ids.add(message_id)
         seen_message_order.append(message_id)
@@ -32,8 +50,6 @@ async def already_processed(message_id: str) -> bool:
         while len(seen_message_order) > MAX_SEEN_MESSAGES:
             oldest_id = seen_message_order.popleft()
             seen_message_ids.discard(oldest_id)
-
-        return False
 
 
 @router.get("")
@@ -59,102 +75,164 @@ async def verify_webhook(
 
 @router.post("")
 async def receive_webhook(request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        print("ERROR: Received invalid JSON.")
+        return {"status": "invalid_json"}
+
+    print(
+        "WEBHOOK RECEIVED:",
+        "object =", data.get("object"),
+        "entries =", len(data.get("entry", [])),
+    )
 
     if data.get("object") != "page":
+        print("Skipping event: object is not 'page'.")
         return {"status": "ignored"}
 
     for entry in data.get("entry", []):
         page_id = entry.get("id")
 
         for event in entry.get("messaging", []):
-            message = event.get("message", {})
+            sender_id = event.get("sender", {}).get("id")
+            message = event.get("message")
 
-            if message.get("is_echo"):
+            print(
+                "EVENT:",
+                "page_id =", page_id,
+                "sender_present =", bool(sender_id),
+                "event_fields =", list(event.keys()),
+            )
+
+            if not message:
+                print("Skipping event: no message object.")
                 continue
 
-            sender_id = event.get("sender", {}).get("id")
+            if message.get("is_echo"):
+                print("Skipping event: message is an echo.")
+                continue
+
             user_message = message.get("text")
             message_id = message.get("mid")
 
-            if not sender_id or not user_message:
+            if not sender_id:
+                print("Skipping event: sender ID is missing.")
                 continue
 
-            # Skip duplicate deliveries of the same Meta message.
-            if message_id:
-                if await already_processed(message_id):
-                    print(f"Ignoring duplicate message ID: {message_id}")
-                    continue
+            if not user_message or not user_message.strip():
+                print(
+                    "Skipping event: message has no text "
+                    "(possibly an attachment or another event type)."
+                )
+                continue
 
             print(
-                f"Processing message ID: {message_id or 'not provided'}"
+                "INCOMING TEXT MESSAGE:",
+                "message_id =", message_id or "missing",
             )
 
-            # Retry temporary Gemini failures up to three times.
+            claimed = False
+
+            if message_id:
+                claimed = await claim_message(message_id)
+
+                if not claimed:
+                    print(
+                        "DUPLICATE OR ALREADY PROCESSING:",
+                        message_id,
+                    )
+                    continue
+
             reply_text = None
 
-            for attempt in range(1, 4):
-                try:
-                    reply_text = await generate_reply(
-                        user_message,
-                        conversation_id=sender_id,
-                    )
-                    print("Gemini generated a reply.")
-                    break
-                except Exception as exc:
-                    print(
-                        f"Gemini attempt {attempt}/3 failed: "
-                        f"{type(exc).__name__}"
-                    )
-
-                    if attempt < 3:
-                        await asyncio.sleep(attempt)
-
-            if not reply_text:
-                reply_text = (
-                    "Sorry, I'm having trouble answering right now. "
-                    "Please try again shortly."
-                )
-
-            page_token = settings.meta_page_access_token
-            if not page_token:
-                print("ERROR: META_PAGE_ACCESS_TOKEN is missing.")
-                continue
-
-            url = (
-                f"https://graph.facebook.com/v26.0/"
-                f"{page_id}/messages"
-            )
-
-            payload = {
-                "recipient": {"id": sender_id},
-                "messaging_type": "RESPONSE",
-                "message": {"text": reply_text},
-            }
-
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    response = await client.post(
-                        url,
-                        json=payload,
-                        headers={
-                            "Authorization": f"Bearer {page_token}"
-                        },
+                for attempt in range(1, 4):
+                    try:
+                        print(f"Calling Gemini: attempt {attempt}/3")
+
+                        reply_text = await generate_reply(
+                            user_message,
+                            conversation_id=sender_id,
+                        )
+
+                        print("Gemini generated a reply.")
+                        break
+
+                    except Exception as exc:
+                        print(
+                            f"Gemini attempt {attempt}/3 failed:",
+                            type(exc).__name__,
+                            str(exc)[:300],
+                        )
+
+                        if attempt < 3:
+                            await asyncio.sleep(attempt)
+
+                if not reply_text:
+                    reply_text = (
+                        "Sorry, I'm having trouble answering right now. "
+                        "Please try again shortly."
                     )
 
-                if response.is_success:
-                    print("Messenger reply sent successfully.")
-                else:
-                    print(
-                        "Messenger API returned HTTP",
-                        response.status_code,
-                    )
-                    print("API response:", response.text[:1000])
+                page_token = settings.meta_page_access_token
 
-            except httpx.HTTPError as exc:
-                print(
-                    "Messenger request failed:",
-                    type(exc).__name__,
+                if not page_token:
+                    print("ERROR: META_PAGE_ACCESS_TOKEN is missing.")
+                    continue
+
+                if not page_id:
+                    print("ERROR: Page ID is missing from the event.")
+                    continue
+
+                url = (
+                    f"https://graph.facebook.com/v26.0/"
+                    f"{page_id}/messages"
                 )
+
+                payload = {
+                    "recipient": {"id": sender_id},
+                    "messaging_type": "RESPONSE",
+                    "message": {"text": reply_text},
+                }
+
+                try:
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        response = await client.post(
+                            url,
+                            json=payload,
+                            headers={
+                                "Authorization": f"Bearer {page_token}"
+                            },
+                        )
+
+                    if response.is_success:
+                        print(
+                            "MESSENGER REPLY SENT SUCCESSFULLY:",
+                            message_id or "no message ID",
+                        )
+
+                        if message_id:
+                            await finish_message(message_id, success=True)
+                            claimed = False
+                    else:
+                        print(
+                            "MESSENGER API ERROR:",
+                            "HTTP", response.status_code,
+                            response.text[:1000],
+                        )
+
+                except httpx.HTTPError as exc:
+                    print(
+                        "MESSENGER REQUEST FAILED:",
+                        type(exc).__name__,
+                        str(exc)[:300],
+                    )
+
+            finally:
+                # If a reply wasn't confirmed as sent, don't mark the
+                # message completed. A later delivery can try again.
+                if message_id and claimed:
+                    await finish_message(message_id, success=False)
 
     return {"status": "received"}
